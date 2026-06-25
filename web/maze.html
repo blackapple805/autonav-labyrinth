@@ -1,0 +1,503 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>AutoNav — labyrinth evolution</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<!--
+  Multi-generation labyrinth replay. Loads maze_run.json (a recording the C++
+  evolutionary runner produced) and plays each robot generation in turn: the
+  early generations stall or time out, and the final evolved generation drives
+  the maze to the goal. The intelligence is all in C++; this only animates it.
+-->
+<style>
+  :root {
+    --bg:#06080c; --panel:#0b0f17; --grid:#141d28; --ink:#cdd9e6; --dim:#5a6b7d;
+    --scan:#19e3c2; --scan-hit:#ff3d6e; --path:#ffb020; --trace:#6ad7ff;
+    --robot:#eaf6ff; --hedge:#0e2a18; --hedge-lit:#2f8f4e; --hedge-deep:#081c10;
+    --corridor:#0a0d12; --goal:#19e3c2;
+    --start:#7CFF8A; --fail:#ff3d6e; --win:#19e3c2; --amber:#ffb020;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--ink);
+    font-family: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, monospace; }
+  .wrap { display: grid; grid-template-columns: 1fr 268px; gap: 1px;
+    background: var(--grid); height: 100%; }
+  @media (max-width: 760px) { .wrap { grid-template-columns: 1fr; grid-template-rows: 1fr auto; } }
+  .stage { background: var(--bg); position: relative; overflow: hidden; }
+  canvas { display: block; width: 100%; height: 100%; }
+
+  /* Big status banner that flashes on each generation's outcome. */
+  .banner { position: absolute; top: 14px; left: 50%; transform: translateX(-50%);
+    padding: 7px 16px; border: 1px solid var(--grid); border-radius: 4px;
+    background: rgba(8,11,17,.78); backdrop-filter: blur(4px);
+    font-size: 12px; letter-spacing: .14em; text-transform: uppercase;
+    white-space: nowrap; transition: border-color .2s, color .2s, opacity .2s; }
+  .banner b { font-weight: 600; }
+
+  .hud { background: var(--panel); padding: 18px 16px; display: flex;
+    flex-direction: column; gap: 16px; overflow-y: auto; }
+  .title { letter-spacing: .22em; font-size: 11px; color: var(--dim); text-transform: uppercase; }
+  .title b { color: var(--scan); font-weight: 600; }
+  .gen { display: flex; align-items: baseline; gap: 8px; }
+  .gen .n { font-size: 30px; font-variant-numeric: tabular-nums; color: var(--ink); line-height: 1; }
+  .gen .of { font-size: 12px; color: var(--dim); }
+  .verdict { font-size: 12px; letter-spacing: .12em; text-transform: uppercase; }
+  .stat { display: flex; flex-direction: column; gap: 3px; }
+  .stat .k { font-size: 9.5px; letter-spacing: .16em; color: var(--dim); text-transform: uppercase; }
+  .stat .v { font-size: 17px; color: var(--ink); font-variant-numeric: tabular-nums; }
+  .stat .v small { font-size: 11px; color: var(--dim); }
+  .bar { height: 3px; background: var(--grid); border-radius: 2px; overflow: hidden; }
+  .bar i { display: block; height: 100%; width: 0; background: var(--scan); transition: width .1s linear; }
+
+  /* Generation ledger: one row per attempt, fills in as they play. */
+  .ledger { display: flex; flex-direction: column; gap: 2px; margin-top: 2px; }
+  .ledger .row { display: grid; grid-template-columns: 22px 1fr auto; gap: 8px;
+    align-items: center; font-size: 10.5px; padding: 3px 4px; border-radius: 3px;
+    color: var(--dim); border: 1px solid transparent; }
+  .ledger .row.cur { border-color: var(--grid); color: var(--ink); }
+  .ledger .row .id { color: var(--dim); font-variant-numeric: tabular-nums; }
+  .ledger .row .res { letter-spacing: .1em; text-transform: uppercase; font-size: 9px; }
+  .ledger .row.win  .res { color: var(--win); }
+  .ledger .row.fail .res { color: var(--fail); }
+  .ledger .row.pend .res { color: var(--dim); }
+  .dotline { display:flex; gap:3px; }
+  .dotline i { width:6px; height:6px; border-radius:50%; background:var(--grid); }
+  .dotline i.fail { background: var(--fail); }
+  .dotline i.win  { background: var(--win); }
+  .dotline i.cur  { box-shadow: 0 0 0 2px rgba(255,255,255,.15); }
+
+  .legend { display: flex; flex-direction: column; gap: 6px; margin-top: 2px; }
+  .legend div { display: flex; align-items: center; gap: 8px; font-size: 10px;
+    color: var(--dim); letter-spacing: .04em; }
+  .swatch { width: 14px; height: 3px; border-radius: 2px; }
+  .controls { margin-top: auto; display: flex; flex-direction: column; gap: 8px; }
+  button { background: transparent; color: var(--ink); border: 1px solid var(--grid);
+    padding: 9px; font: inherit; font-size: 11px; letter-spacing: .12em;
+    text-transform: uppercase; cursor: pointer; border-radius: 3px;
+    transition: border-color .15s, color .15s; }
+  button:hover { border-color: var(--scan); color: var(--scan); }
+  .row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .err { color: var(--scan-hit); font-size: 12px; padding: 20px; line-height: 1.7;
+    white-space: pre-wrap; }
+</style>
+
+<div class="wrap">
+  <div class="stage">
+    <canvas id="cv"></canvas>
+    <div class="banner" id="banner">initializing…</div>
+  </div>
+  <aside class="hud">
+    <div class="title">AUTO<b>NAV</b> · labyrinth evolution</div>
+
+    <div class="gen">
+      <span class="n" id="genNum">0</span>
+      <span class="of">/ <span id="genTot">0</span> generations</span>
+    </div>
+    <div class="verdict" id="verdict" style="color:var(--dim)">standby</div>
+
+    <div class="stat"><span class="k">Map</span>
+      <span class="v" id="mapName" style="font-size:13px">—</span></div>
+    <div class="stat"><span class="k">Swarm size</span>
+      <span class="v"><span id="dist">--</span></span></div>
+    <div class="stat"><span class="k">Reached the goal</span>
+      <span class="v"><span id="closest">--</span></span></div>
+    <div class="bar"><i id="prog"></i></div>
+
+    <div class="dotline" id="dots"></div>
+    <div class="ledger" id="ledger"></div>
+
+    <div class="legend">
+      <div><span class="swatch" style="background:var(--trace)"></span>dot that reached goal</div>
+      <div><span class="swatch" style="background:var(--fail)"></span>dot that gave up</div>
+      <div><span class="swatch" style="background:var(--win)"></span>arrived at goal</div>
+    </div>
+
+    <div class="controls">
+      <div class="row2">
+        <button id="pause">❙❙ pause</button>
+        <button id="speed">▸ 1×</button>
+      </div>
+      <button id="replay">↻ replay from gen 0</button>
+      <button id="skip">↦ skip to winner</button>
+    </div>
+  </aside>
+</div>
+
+<script>
+const cv = document.getElementById('cv');
+const ctx = cv.getContext('2d');
+const el = id => document.getElementById(id);
+const css = v => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+
+let RUN = null, gi = 0, frame = 0, playing = true, dpr = 1, speed = 1;
+const SPEEDS = [1, 2, 4];
+
+function showError(msg) {
+  document.querySelector('.stage').innerHTML = '<div class="err">' + msg + '</div>';
+}
+
+async function load() {
+  let text;
+  try {
+    const res = await fetch('maze_run.json');
+    if (!res.ok) {
+      showError('Could not fetch maze_run.json (HTTP ' + res.status + ').\n\n' +
+        'Generate it first, then serve the web/ folder:\n\n' +
+        '  make maze              # photo-traced Beaulieu maze\n' +
+        '  make maze MAP=seeded   # procedural seeded maze\n' +
+        '  cd web && python3 -m http.server\n' +
+        '  open http://localhost:8000/maze.html');
+      return;
+    }
+    text = await res.text();
+  } catch (e) {
+    showError('Network error loading maze_run.json:\n\n' + e.message +
+      '\n\nServe the folder over http (python3 -m http.server),\nnot by opening the file directly.');
+    return;
+  }
+  try { RUN = JSON.parse(text); }
+  catch (e) { showError('maze_run.json is not valid JSON:\n\n' + e.message); return; }
+
+  const problems = [];
+  if (!RUN.world || typeof RUN.world.w !== 'number') problems.push('world.w');
+  if (!Array.isArray(RUN.obstacles)) problems.push('obstacles[]');
+  if (!Array.isArray(RUN.generations) || !RUN.generations.length) problems.push('generations[]');
+  if (problems.length) {
+    showError('maze_run.json loaded but is missing fields:\n\n  ' + problems.join(', '));
+    return;
+  }
+
+  el('genTot').textContent = RUN.generations.length;
+  el('mapName').textContent = RUN.map === 'seeded' ? 'procedural (seeded)' : 'Beaulieu hedge maze (traced)';
+  buildLedger();
+  buildDots();
+  resize();
+  requestAnimationFrame(tick);
+}
+
+function buildDots() {
+  const d = el('dots'); d.innerHTML = '';
+  RUN.generations.forEach(() => { const i = document.createElement('i'); d.appendChild(i); });
+}
+function buildLedger() {
+  const L = el('ledger'); L.innerHTML = '';
+  RUN.generations.forEach((g, i) => {
+    const row = document.createElement('div');
+    row.className = 'row pend'; row.id = 'lg' + i;
+    row.innerHTML = '<span class="id">' + String(i).padStart(2,'0') + '</span>' +
+      '<span class="lab">awaiting…</span><span class="res">·</span>';
+    L.appendChild(row);
+  });
+}
+
+// Mark a generation's ledger row + dot once we know its outcome (when we
+// start playing it, the result is already known from the recording).
+function settleLedger(i) {
+  const g = RUN.generations[i];
+  const row = el('lg' + i); if (!row) return;
+  const win = g.success;
+  row.className = 'row ' + (win ? 'win' : 'fail');
+  const label = win
+    ? (g.reached + ' of ' + g.n_dots + ' dots solved it')
+    : (g.n_dots + ' dots — none reached the goal');
+  row.querySelector('.lab').textContent = label;
+  row.querySelector('.res').textContent = win ? (g.reached + '/' + g.n_dots) : 'lost';
+  const dot = el('dots').children[i];
+  if (dot) dot.className = win ? 'win' : 'fail';
+}
+
+function resize() {
+  dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const r = cv.getBoundingClientRect();
+  cv.width = Math.max(1, r.width * dpr);
+  cv.height = Math.max(1, r.height * dpr);
+}
+window.addEventListener('resize', resize);
+
+function transform() {
+  const W = RUN.world.w, H = RUN.world.h;
+  const pad = 22 * dpr;
+  const s = Math.min((cv.width - pad*2)/W, (cv.height - pad*2)/H);
+  const ox = (cv.width - s*W)/2, oy = (cv.height - s*H)/2;
+  return { s, px: wx => ox + wx*s, py: wy => cv.height - (oy + wy*s) };
+}
+
+// The maze itself never changes between generations, so render it once to an
+// offscreen canvas and blit it — far cheaper than redrawing 10k cells/frame.
+let mazeLayer = null, mazeKey = '';
+function buildMazeLayer(T) {
+  const key = cv.width + 'x' + cv.height;
+  if (mazeLayer && mazeKey === key) return;
+  mazeKey = key;
+  mazeLayer = document.createElement('canvas');
+  mazeLayer.width = cv.width; mazeLayer.height = cv.height;
+  const m = mazeLayer.getContext('2d');
+
+  const res = RUN.world.res;
+  const GW = Math.round(RUN.world.w / res);
+  const GH = Math.round(RUN.world.h / res);
+
+  const occ = new Uint8Array(GW * GH);
+  for (const o of RUN.obstacles) {
+    const gx = Math.floor(o[0] / res), gy = Math.floor(o[1] / res);
+    if (gx >= 0 && gx < GW && gy >= 0 && gy < GH) occ[gy * GW + gx] = 1;
+  }
+  const isWall = (x, y) => (x < 0 || x >= GW || y < 0 || y >= GH) ? 1 : occ[y * GW + x];
+
+  const cell = res * T.s;
+  const wx = gx => T.px((gx + 0.5) * res);
+  const wy = gy => T.py((gy + 0.5) * res);
+
+  // 1) corridor floor.
+  m.fillStyle = css('--corridor');
+  m.fillRect(0, 0, mazeLayer.width, mazeLayer.height);
+
+  // 2+3) hedge mass, drawn as ROUNDED tiles so the stair-stepped grid reads as
+  // smooth organic hedge instead of hard pixels. Each hedge cell is a rounded
+  // rect; because neighbouring cells overlap slightly, contiguous hedge merges
+  // into one smooth blob while isolated corners stay rounded. A soft blur on
+  // the layer finishes the anti-aliasing.
+  const over = cell * 0.62;          // half-size + overlap so cells fuse
+  const round = Math.min(cell * 0.45, 6 * dpr);
+  const roundRect = (cx, cy, hw, r, fill) => {
+    m.beginPath();
+    m.moveTo(cx - hw + r, cy - hw);
+    m.arcTo(cx + hw, cy - hw, cx + hw, cy + hw, r);
+    m.arcTo(cx + hw, cy + hw, cx - hw, cy + hw, r);
+    m.arcTo(cx - hw, cy + hw, cx - hw, cy - hw, r);
+    m.arcTo(cx - hw, cy - hw, cx + hw, cy - hw, r);
+    m.closePath();
+    m.fillStyle = fill; m.fill();
+  };
+  // deep body first
+  for (const o of RUN.obstacles) {
+    const gx = Math.floor(o[0]/res), gy = Math.floor(o[1]/res);
+    roundRect(wx(gx), wy(gy), over, round, css('--hedge-deep'));
+  }
+  // lighter "top" on interior cells for a sense of mass
+  for (const o of RUN.obstacles) {
+    const gx = Math.floor(o[0]/res), gy = Math.floor(o[1]/res);
+    if (isWall(gx-1,gy) && isWall(gx+1,gy) && isWall(gx,gy-1) && isWall(gx,gy+1))
+      roundRect(wx(gx), wy(gy), cell*0.5, round, css('--hedge'));
+  }
+
+  // 4) lit rim — bright green on corridor-facing faces, with rounded joins so
+  // the outline curves around corners instead of stepping.
+  m.lineWidth = Math.max(1.2, cell * 0.3);
+  m.strokeStyle = css('--hedge-lit');
+  m.lineCap = 'round';
+  m.lineJoin = 'round';
+  m.beginPath();
+  for (const o of RUN.obstacles) {
+    const gx = Math.floor(o[0]/res), gy = Math.floor(o[1]/res);
+    const cx = wx(gx), cy = wy(gy), h = cell / 2;
+    if (!isWall(gx, gy + 1)) { m.moveTo(cx - h, cy - h); m.lineTo(cx + h, cy - h); }
+    if (!isWall(gx, gy - 1)) { m.moveTo(cx - h, cy + h); m.lineTo(cx + h, cy + h); }
+    if (!isWall(gx - 1, gy)) { m.moveTo(cx - h, cy - h); m.lineTo(cx - h, cy + h); }
+    if (!isWall(gx + 1, gy)) { m.moveTo(cx + h, cy - h); m.lineTo(cx + h, cy + h); }
+  }
+  m.globalAlpha = 0.85;
+  m.stroke();
+  m.globalAlpha = 1;
+
+  // 5) a gentle blur pass to anti-alias the remaining hard edges, so corners
+  // look softly rounded rather than pixelated. Re-draw the layer onto itself
+  // through a small blur filter.
+  if (m.filter !== undefined) {
+    const tmp = document.createElement('canvas');
+    tmp.width = mazeLayer.width; tmp.height = mazeLayer.height;
+    const tctx = tmp.getContext('2d');
+    tctx.drawImage(mazeLayer, 0, 0);
+    m.clearRect(0, 0, mazeLayer.width, mazeLayer.height);
+    m.fillStyle = css('--corridor');
+    m.fillRect(0, 0, mazeLayer.width, mazeLayer.height);
+    m.filter = `blur(${Math.max(0.4, cell * 0.06)}px)`;
+    m.drawImage(tmp, 0, 0);
+    m.filter = 'none';
+  }
+}
+
+function drawPath(T) {
+  // The planned A* route is intentionally NOT drawn: the robot should appear to
+  // discover the exit on its own. (The global plan is still computed internally
+  // and used by the final generation; we just don't reveal it on screen.)
+  return;
+}
+
+function drawMarkers(T) {
+  if (Array.isArray(RUN.start)) {
+    const x = T.px(RUN.start[0]), y = T.py(RUN.start[1]), r = 6*dpr;
+    ctx.fillStyle = css('--start'); ctx.globalAlpha = .9;
+    ctx.beginPath(); ctx.arc(x, y, r*0.5, 0, 7); ctx.fill(); ctx.globalAlpha = 1;
+  }
+  if (Array.isArray(RUN.goal)) {
+    const x = T.px(RUN.goal[0]), y = T.py(RUN.goal[1]), r = 9*dpr;
+    ctx.strokeStyle = css('--goal'); ctx.lineWidth = 1.5*dpr; ctx.globalAlpha = .95;
+    ctx.beginPath(); ctx.arc(x, y, r, 0, 7); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(x-r,y); ctx.lineTo(x+r,y);
+    ctx.moveTo(x,y-r); ctx.lineTo(x,y+r); ctx.stroke(); ctx.globalAlpha = 1;
+  }
+}
+
+function setBanner(text, color) {
+  const b = el('banner');
+  b.innerHTML = text; b.style.color = color; b.style.borderColor = color;
+}
+
+// Longest dot path in a generation determines the animation length.
+function genLength(gen) {
+  let n = 0;
+  for (const d of gen.dots) n = Math.max(n, d.path.length);
+  return n;
+}
+
+// Draw one dot's traveled trail up to `upto`.
+function drawDotTrail(T, dot, upto) {
+  const reached = dot.reached;
+  ctx.strokeStyle = reached ? css('--trace') : css('--fail');
+  ctx.globalAlpha = reached ? 0.8 : 0.32;
+  ctx.lineWidth = (reached ? 1.6 : 1.0) * dpr;
+  ctx.lineJoin = 'round';
+  ctx.beginPath();
+  const n = Math.min(upto, dot.path.length - 1);
+  for (let i = 0; i <= n; i++) {
+    const p = dot.path[i];
+    i ? ctx.lineTo(T.px(p[0]), T.py(p[1])) : ctx.moveTo(T.px(p[0]), T.py(p[1]));
+  }
+  ctx.stroke();
+  ctx.globalAlpha = 1;
+}
+
+// Draw a dot at its current position.
+function drawDotHead(T, dot, frame) {
+  const i = Math.min(frame, dot.path.length - 1);
+  const p = dot.path[i];
+  const x = T.px(p[0]), y = T.py(p[1]);
+  const arrived = dot.reached && frame >= dot.path.length - 1;
+  const r = (RUN.robot_radius || 0.1) * T.s;
+  const rr = Math.max(2.5 * dpr, r);
+  ctx.fillStyle = arrived ? css('--win') : (dot.reached ? css('--robot') : css('--fail'));
+  ctx.shadowColor = dot.reached ? css('--scan') : css('--fail');
+  ctx.shadowBlur = (dot.reached ? 8 : 4) * dpr;
+  ctx.globalAlpha = dot.reached ? 1 : 0.7;
+  ctx.beginPath(); ctx.arc(x, y, rr, 0, 7); ctx.fill();
+  ctx.shadowBlur = 0; ctx.globalAlpha = 1;
+}
+
+// Faint ghosts of all previous generations' reached dots, so you see the swarm
+// learning the maze over time.
+function drawSwarmGhosts(T, curIdx) {
+  ctx.lineWidth = 1 * dpr; ctx.globalAlpha = 0.06;
+  for (let g = 0; g < curIdx; g++) {
+    const gen = RUN.generations[g];
+    for (const dot of gen.dots) {
+      ctx.strokeStyle = dot.reached ? css('--trace') : css('--fail');
+      ctx.beginPath();
+      dot.path.forEach((p,i)=> i ? ctx.lineTo(T.px(p[0]),T.py(p[1])) : ctx.moveTo(T.px(p[0]),T.py(p[1])));
+      ctx.stroke();
+    }
+  }
+  ctx.globalAlpha = 1;
+}
+
+function render() {
+  const T = transform();
+  buildMazeLayer(T);
+  ctx.clearRect(0, 0, cv.width, cv.height);
+  ctx.drawImage(mazeLayer, 0, 0);
+
+  const gen = RUN.generations[gi];
+  const fail = !gen.success;
+  const len = genLength(gen);
+
+  drawPath(T);
+  drawMarkers(T);
+  drawSwarmGhosts(T, gi);
+
+  // trails first (so heads sit on top), reached dots last so they read clearly
+  for (const dot of gen.dots) if (!dot.reached) drawDotTrail(T, dot, frame);
+  for (const dot of gen.dots) if (dot.reached) drawDotTrail(T, dot, frame);
+  for (const dot of gen.dots) if (!dot.reached) drawDotHead(T, dot, frame);
+  for (const dot of gen.dots) if (dot.reached) drawDotHead(T, dot, frame);
+
+  // HUD
+  el('genNum').textContent = gen.index;
+  // live count of dots that have reached the goal by this frame
+  let arrived = 0;
+  for (const dot of gen.dots) if (dot.reached && frame >= dot.path.length - 1) arrived++;
+  el('dist').textContent = gen.dots.length + ' dots';
+  el('closest').textContent = arrived + ' / ' + gen.dots.length + ' reached';
+  el('prog').style.width = (100*frame/Math.max(1, len-1)) + '%';
+
+  RUN.generations.forEach((_, i) => {
+    const row = el('lg' + i); if (row) row.classList.toggle('cur', i === gi);
+  });
+  [...el('dots').children].forEach((d,i)=>d.classList.toggle('cur', i===gi));
+
+  const atEnd = frame >= len - 1;
+  if (!atEnd) {
+    setBanner('GEN <b>' + gen.index + '</b> — swarm of ' + gen.dots.length + ' exploring', css('--amber'));
+    el('verdict').textContent = 'exploring'; el('verdict').style.color = css('--amber');
+    el('prog').parentElement.querySelector('i').style.background = css('--scan');
+  } else if (fail) {
+    setBanner('GEN <b>' + gen.index + '</b> — swarm lost · none reached the goal', css('--fail'));
+    el('verdict').textContent = 'no dot solved it';
+    el('verdict').style.color = css('--fail');
+    el('prog').parentElement.querySelector('i').style.background = css('--fail');
+  } else {
+    setBanner('GEN <b>' + gen.index + '</b> — ' + gen.reached + ' OF ' + gen.dots.length + ' SOLVED IT ✦', css('--win'));
+    el('verdict').textContent = gen.reached + ' dots reached the goal';
+    el('verdict').style.color = css('--win');
+    el('prog').parentElement.querySelector('i').style.background = css('--win');
+  }
+}
+
+let last = 0, holdEnd = 0;
+function tick(ts) {
+  if (!RUN) return;
+  const interval = 33 / speed;
+  if (playing && ts - last > interval) {
+    last = ts;
+    render();
+    const gen = RUN.generations[gi];
+    const len = genLength(gen);
+    if (frame < len - 1) {
+      frame++;
+    } else {
+      settleLedger(gi);
+      holdEnd += speed;
+      // pause on the final generation; brief beat between others
+      const last_gen = gi >= RUN.generations.length - 1;
+      const holdFor = last_gen ? 1e9 : 18;
+      if (holdEnd > holdFor) {
+        holdEnd = 0;
+        if (gi < RUN.generations.length - 1) { gi++; frame = 0; }
+      }
+    }
+  }
+  requestAnimationFrame(tick);
+}
+
+el('pause').onclick = () => {
+  playing = !playing;
+  el('pause').textContent = playing ? '❙❙ pause' : '▸ play';
+};
+el('speed').onclick = () => {
+  speed = SPEEDS[(SPEEDS.indexOf(speed) + 1) % SPEEDS.length];
+  el('speed').textContent = '▸ ' + speed + '×';
+};
+el('replay').onclick = () => {
+  gi = 0; frame = 0; holdEnd = 0; playing = true;
+  el('pause').textContent = '❙❙ pause';
+  buildLedger(); buildDots();
+};
+el('skip').onclick = () => {
+  // Jump straight to the first successful generation.
+  const w = RUN.generations.findIndex(g => g.success);
+  for (let i = 0; i < (w < 0 ? RUN.generations.length : w); i++) settleLedger(i);
+  gi = w < 0 ? RUN.generations.length - 1 : w;
+  frame = 0; holdEnd = 0; playing = true;
+  el('pause').textContent = '❙❙ pause';
+};
+
+load();
+</script>

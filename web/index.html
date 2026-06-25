@@ -1,0 +1,265 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>AutoNav — autonomous navigation visualizer</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<!--
+  Thin replay client. Loads run.json (a recording produced by the C++ autonomy
+  stack) and animates it. The intelligence lives in C++; this just shows it.
+-->
+<style>
+  :root {
+    --bg:#07090d; --panel:#0d1119; --grid:#16202c; --ink:#c9d6e2; --dim:#5b6b7c;
+    --scan:#19e3c2; --scan-hit:#ff3d6e; --path:#ffb020; --trace:#6ad7ff;
+    --robot:#eaf6ff; --obstacle:#1f2c3a; --goal:#19e3c2;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--ink);
+    font-family: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, monospace; }
+  .wrap { display: grid; grid-template-columns: 1fr 240px; gap: 1px;
+    background: var(--grid); height: 100%; }
+  @media (max-width: 720px) { .wrap { grid-template-columns: 1fr; grid-template-rows: 1fr auto; } }
+  .stage { background: var(--bg); position: relative; overflow: hidden; }
+  canvas { display: block; width: 100%; height: 100%; }
+  .hud { background: var(--panel); padding: 18px 16px; display: flex;
+    flex-direction: column; gap: 18px; }
+  .title { letter-spacing: .22em; font-size: 11px; color: var(--dim); text-transform: uppercase; }
+  .title b { color: var(--scan); font-weight: 600; }
+  .stat { display: flex; flex-direction: column; gap: 3px; }
+  .stat .k { font-size: 9.5px; letter-spacing: .16em; color: var(--dim); text-transform: uppercase; }
+  .stat .v { font-size: 19px; color: var(--ink); font-variant-numeric: tabular-nums; }
+  .stat .v small { font-size: 11px; color: var(--dim); }
+  .legend { display: flex; flex-direction: column; gap: 7px; margin-top: 2px; }
+  .legend div { display: flex; align-items: center; gap: 8px; font-size: 10px;
+    color: var(--dim); letter-spacing: .04em; }
+  .swatch { width: 14px; height: 3px; border-radius: 2px; }
+  .controls { margin-top: auto; display: flex; flex-direction: column; gap: 10px; }
+  button { background: transparent; color: var(--ink); border: 1px solid var(--grid);
+    padding: 9px; font: inherit; font-size: 11px; letter-spacing: .12em;
+    text-transform: uppercase; cursor: pointer; border-radius: 3px;
+    transition: border-color .15s, color .15s; }
+  button:hover { border-color: var(--scan); color: var(--scan); }
+  .bar { height: 3px; background: var(--grid); border-radius: 2px; overflow: hidden; }
+  .bar i { display: block; height: 100%; width: 0; background: var(--scan); }
+  .err { color: var(--scan-hit); font-size: 12px; padding: 20px; line-height: 1.7;
+    white-space: pre-wrap; }
+</style>
+
+<div class="wrap">
+  <div class="stage"><canvas id="cv"></canvas></div>
+  <aside class="hud">
+    <div class="title">AUTO<b>NAV</b> · telemetry</div>
+    <div class="stat"><span class="k">Mission time</span>
+      <span class="v"><span id="t">0.00</span><small> s</small></span></div>
+    <div class="stat"><span class="k">Position (m)</span>
+      <span class="v" id="pos" style="font-size:14px">0.00, 0.00</span></div>
+    <div class="stat"><span class="k">Heading</span>
+      <span class="v"><span id="hd">0</span><small>°</small></span></div>
+    <div class="stat"><span class="k">Nearest obstacle</span>
+      <span class="v"><span id="clr">--</span><small> m</small></span></div>
+    <div class="bar"><i id="prog"></i></div>
+    <div class="legend">
+      <div><span class="swatch" style="background:var(--path)"></span>planned path (A*)</div>
+      <div><span class="swatch" style="background:var(--trace)"></span>actual route</div>
+      <div><span class="swatch" style="background:var(--scan)"></span>lidar beam</div>
+      <div><span class="swatch" style="background:var(--scan-hit)"></span>obstacle hit</div>
+    </div>
+    <div class="controls">
+      <button id="replay">↻ replay</button>
+      <button id="pause">❙❙ pause</button>
+    </div>
+  </aside>
+</div>
+
+<script>
+const cv = document.getElementById('cv');
+const ctx = cv.getContext('2d');
+const el = id => document.getElementById(id);
+const getCSS = v => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+
+let RUN = null, frame = 0, playing = true, dpr = 1;
+
+function showError(msg) {
+  document.querySelector('.stage').innerHTML =
+    '<div class="err">' + msg + '</div>';
+}
+
+// Load is the ONLY place that catches fetch/parse problems. Rendering errors
+// are deliberately NOT swallowed here so they surface with a real message.
+async function load() {
+  let text;
+  try {
+    const res = await fetch('run.json');
+    if (!res.ok) {
+      showError('Could not fetch run.json (HTTP ' + res.status + ').\n\n' +
+        'Generate it first, then serve the web/ folder:\n\n' +
+        '  g++ -std=c++17 -O2 -Iinclude web/gen_web_data.cpp -o build/gen_web_data.exe\n' +
+        '  .\\build\\gen_web_data.exe > web/run.json\n' +
+        '  cd web && python -m http.server');
+      return;
+    }
+    text = await res.text();
+  } catch (e) {
+    showError('Network error loading run.json:\n\n' + e.message +
+      '\n\nMake sure you are serving the folder over http\n' +
+      '(python -m http.server), not opening the file directly.');
+    return;
+  }
+
+  try {
+    RUN = JSON.parse(text);
+  } catch (e) {
+    showError('run.json is not valid JSON:\n\n' + e.message +
+      '\n\nRegenerate it:\n  .\\build\\gen_web_data.exe > web/run.json');
+    return;
+  }
+
+  // Validate the shape so a missing field gives a clear message, not a crash.
+  const problems = [];
+  if (!RUN.world || typeof RUN.world.w !== 'number') problems.push('world.w');
+  if (!Array.isArray(RUN.obstacles)) problems.push('obstacles[]');
+  if (!Array.isArray(RUN.path)) problems.push('path[]');
+  if (!Array.isArray(RUN.frames) || RUN.frames.length === 0) problems.push('frames[]');
+  if (problems.length) {
+    showError('run.json loaded but is missing or malformed:\n\n  ' +
+      problems.join(', ') + '\n\nRegenerate it with gen_web_data.');
+    return;
+  }
+
+  resize();
+  requestAnimationFrame(tick);
+}
+
+function resize() {
+  dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const r = cv.getBoundingClientRect();
+  cv.width = Math.max(1, r.width * dpr);
+  cv.height = Math.max(1, r.height * dpr);
+}
+window.addEventListener('resize', resize);
+
+function transform() {
+  const W = RUN.world.w, H = RUN.world.h;
+  const pad = 24 * dpr;
+  const s = Math.min((cv.width - pad * 2) / W, (cv.height - pad * 2) / H);
+  const ox = (cv.width - s * W) / 2;
+  const oy = (cv.height - s * H) / 2;
+  return { s, px: wx => ox + wx * s, py: wy => cv.height - (oy + wy * s) };
+}
+
+function drawGrid(T) {
+  ctx.strokeStyle = getCSS('--grid'); ctx.lineWidth = 1; ctx.globalAlpha = 0.5;
+  for (let x = 0; x <= RUN.world.w; x += 2) {
+    ctx.beginPath(); ctx.moveTo(T.px(x), T.py(0)); ctx.lineTo(T.px(x), T.py(RUN.world.h)); ctx.stroke();
+  }
+  for (let y = 0; y <= RUN.world.h; y += 2) {
+    ctx.beginPath(); ctx.moveTo(T.px(0), T.py(y)); ctx.lineTo(T.px(RUN.world.w), T.py(y)); ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawObstacles(T) {
+  const cell = RUN.world.res * T.s;
+  ctx.fillStyle = getCSS('--obstacle');
+  for (const o of RUN.obstacles) {
+    const x = o[0], y = o[1];
+    ctx.fillRect(T.px(x) - cell / 2, T.py(y) - cell / 2, cell + 1, cell + 1);
+  }
+}
+
+function drawPath(T) {
+  if (!RUN.path.length) return;
+  ctx.strokeStyle = getCSS('--path'); ctx.lineWidth = 1.5 * dpr;
+  ctx.setLineDash([5 * dpr, 5 * dpr]); ctx.globalAlpha = 0.7;
+  ctx.beginPath();
+  RUN.path.forEach((p, i) => i ? ctx.lineTo(T.px(p[0]), T.py(p[1])) : ctx.moveTo(T.px(p[0]), T.py(p[1])));
+  ctx.stroke(); ctx.setLineDash([]); ctx.globalAlpha = 1;
+  ctx.fillStyle = getCSS('--path');
+  for (const p of RUN.path) { ctx.beginPath(); ctx.arc(T.px(p[0]), T.py(p[1]), 2.5 * dpr, 0, 7); ctx.fill(); }
+}
+
+function drawTrace(T, upto) {
+  ctx.strokeStyle = getCSS('--trace'); ctx.lineWidth = 2 * dpr;
+  ctx.shadowColor = getCSS('--trace'); ctx.shadowBlur = 6 * dpr;
+  ctx.beginPath();
+  for (let i = 0; i <= upto; i++) {
+    const f = RUN.frames[i];
+    i ? ctx.lineTo(T.px(f.x), T.py(f.y)) : ctx.moveTo(T.px(f.x), T.py(f.y));
+  }
+  ctx.stroke(); ctx.shadowBlur = 0;
+}
+
+function drawScan(T, f) {
+  if (!Array.isArray(f.scan)) return;
+  for (const beam of f.scan) {
+    const ang = beam[0], range = beam[1], hit = beam[2];
+    const wa = f.t + ang;
+    const ex = f.x + Math.cos(wa) * range;
+    const ey = f.y + Math.sin(wa) * range;
+    ctx.strokeStyle = hit ? getCSS('--scan-hit') : getCSS('--scan');
+    ctx.globalAlpha = hit ? 0.5 : 0.13; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(T.px(f.x), T.py(f.y)); ctx.lineTo(T.px(ex), T.py(ey)); ctx.stroke();
+    if (hit) {
+      ctx.globalAlpha = 0.9; ctx.fillStyle = getCSS('--scan-hit');
+      ctx.beginPath(); ctx.arc(T.px(ex), T.py(ey), 1.6 * dpr, 0, 7); ctx.fill();
+    }
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawRobot(T, f) {
+  const x = T.px(f.x), y = T.py(f.y), r = 7 * dpr;
+  ctx.fillStyle = getCSS('--robot');
+  ctx.shadowColor = getCSS('--scan'); ctx.shadowBlur = 14 * dpr;
+  ctx.beginPath(); ctx.arc(x, y, r, 0, 7); ctx.fill(); ctx.shadowBlur = 0;
+  ctx.strokeStyle = getCSS('--bg'); ctx.lineWidth = 2 * dpr;
+  ctx.beginPath(); ctx.moveTo(x, y);
+  ctx.lineTo(x + Math.cos(f.t) * r, y - Math.sin(f.t) * r); ctx.stroke();
+}
+
+function drawGoal(T) {
+  if (!Array.isArray(RUN.goal)) return;
+  const x = T.px(RUN.goal[0]), y = T.py(RUN.goal[1]), r = 9 * dpr;
+  ctx.strokeStyle = getCSS('--goal'); ctx.lineWidth = 1.5 * dpr; ctx.globalAlpha = 0.9;
+  ctx.beginPath(); ctx.arc(x, y, r, 0, 7); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(x - r, y); ctx.lineTo(x + r, y);
+  ctx.moveTo(x, y - r); ctx.lineTo(x, y + r); ctx.stroke();
+  ctx.globalAlpha = 1;
+}
+
+function nearestHit(f) {
+  let m = Infinity;
+  if (Array.isArray(f.scan)) for (const b of f.scan) if (b[2]) m = Math.min(m, b[1]);
+  return m;
+}
+
+function render() {
+  const T = transform();
+  ctx.clearRect(0, 0, cv.width, cv.height);
+  drawGrid(T); drawObstacles(T); drawPath(T); drawGoal(T); drawTrace(T, frame);
+  const f = RUN.frames[frame];
+  drawScan(T, f); drawRobot(T, f);
+  el('t').textContent = (frame * 0.1).toFixed(2);
+  el('pos').textContent = f.x.toFixed(2) + ', ' + f.y.toFixed(2);
+  el('hd').textContent = Math.round(f.t * 180 / Math.PI);
+  const nh = nearestHit(f);
+  el('clr').textContent = isFinite(nh) ? nh.toFixed(2) : '∞';
+  el('clr').style.color = isFinite(nh) && nh < 0.8 ? getCSS('--scan-hit') : getCSS('--ink');
+  el('prog').style.width = (100 * frame / (RUN.frames.length - 1)) + '%';
+}
+
+let last = 0;
+function tick(ts) {
+  if (!RUN) return;
+  if (playing && ts - last > 33) {
+    last = ts;
+    render();
+    if (frame < RUN.frames.length - 1) frame++;
+  }
+  requestAnimationFrame(tick);
+}
+
+el('replay').onclick = () => { frame = 0; playing = true; el('pause').textContent = '❙❙ pause'; };
+el('pause').onclick = () => { playing = !playing; el('pause').textContent = playing ? '❙❙ pause' : '▶ play'; };
+
+load();
+</script>

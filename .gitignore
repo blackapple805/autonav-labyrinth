@@ -1,0 +1,12 @@
+build/
+*.o
+*.out
+*.exe
+.DS_Store
+
+# Local AI assistant instructions (references a private knowledge base)
+CLAUDE.md
+
+# Local HTTPS certificates — never commit private keys
+*.pem
+localhost+*.pem
